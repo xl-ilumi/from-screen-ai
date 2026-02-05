@@ -37,7 +37,10 @@ async function runAITeam() {
     .select()
     .single();
 
-  if (restaurant) {
+  if (error) {
+    console.error("❌ 데이터 저장 중 에러 발생:", error.message);
+    console.error("상세 정보:", error.details);
+  } else if (restaurant) {
     console.log(`✅ ${restaurant.name} 정보 저장 완료!`);
   }
 }
