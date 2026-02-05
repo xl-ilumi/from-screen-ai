@@ -31,7 +31,7 @@ async function runAITeam() {
 
   // 2. 데이터베이스 저장 (이미지 스키마 기준)
   // restaurants 테이블 저장 (이름 중복 시 업데이트)
-  const { data: restaurant } = await supabase
+  const { data: restaurant, error } = await supabase
     .from("restaurants")
     .upsert({ name: data.name, address: data.address }, { onConflict: "name" })
     .select()
