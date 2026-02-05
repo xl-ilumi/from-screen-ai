@@ -29,6 +29,12 @@ async function runAITeam() {
 
   const data = JSON.parse(chatCompletion.choices[0].message.content);
 
+  console.log("-----------------------------------------");
+  console.log("🔍 AI 리서치 결과:");
+  console.log(`식당명: ${data.name}`);
+  console.log(`주소: ${data.address}`);
+  console.log("-----------------------------------------");
+
   // 2. 데이터베이스 저장 (이미지 스키마 기준)
   // restaurants 테이블 저장 (이름 중복 시 업데이트)
   const { data: restaurant, error } = await supabase
