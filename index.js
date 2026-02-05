@@ -10,33 +10,45 @@ const supabase = createClient(
 );
 
 async function runAITeam() {
-  // 1. AI에게 정보 수집 요청 (Llama 3 모델 사용)
   const chatCompletion = await groq.chat.completions.create({
     messages: [
       {
         role: "system",
-        content:
-          "너는 흑백요리사 식당 정보를 수집하는 에이전트야. 반드시 JSON 형식으로 답변해.",
+        content: `너는 식당 정보를 수집하는 에이전트야. 
+        반드시 아래 JSON 형식을 지켜서 답변해:
+        {
+          "name": "식당이름",
+          "address": "식당주소"
+        }`,
       },
       {
         role: "user",
-        content: "최근 방송된 흑백요리사 식당 1곳과 관련 유튜브 URL을 찾아줘.",
+        content:
+          "흑백요리사에 출연한 셰프의 식당 1곳을 추천하고 주소를 알려줘.",
       },
     ],
-    model: "llama-3.3-70b-versatile", // Groq에서 제공하는 고성능 모델
+    model: "llama-3.3-70b-versatile",
     response_format: { type: "json_object" },
   });
 
-  const data = JSON.parse(chatCompletion.choices[0].message.content);
+  // AI가 보낸 원본 텍스트 확인 (디버깅용)
+  const rawContent = chatCompletion.choices[0].message.content;
+  console.log("🤖 AI 원본 응답:", rawContent);
+
+  const data = JSON.parse(rawContent);
 
   console.log("-----------------------------------------");
-  console.log("🔍 AI 리서치 결과:");
+  console.log("🔍 추출된 데이터:");
   console.log(`식당명: ${data.name}`);
   console.log(`주소: ${data.address}`);
   console.log("-----------------------------------------");
 
-  // 2. 데이터베이스 저장 (이미지 스키마 기준)
-  // restaurants 테이블 저장 (이름 중복 시 업데이트)
+  // 데이터가 정상일 때만 DB 저장 시도
+  if (!data.name || !data.address) {
+    console.error("❌ AI가 유효한 데이터를 생성하지 못했습니다.");
+    return;
+  }
+
   const { data: restaurant, error } = await supabase
     .from("restaurants")
     .upsert({ name: data.name, address: data.address }, { onConflict: "name" })
@@ -45,7 +57,6 @@ async function runAITeam() {
 
   if (error) {
     console.error("❌ 데이터 저장 중 에러 발생:", error.message);
-    console.error("상세 정보:", error.details);
   } else if (restaurant) {
     console.log(`✅ ${restaurant.name} 정보 저장 완료!`);
   }
