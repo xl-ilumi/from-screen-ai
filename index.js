@@ -21,32 +21,32 @@ async function getSearchData(query) {
         },
       },
     );
-    // 네이버 플레이스 링크나 주소 정보가 포함된 상위 검색결과 전달
+    // 상위 5개 결과 전달 (네이버 플레이스 정보 포함 확률 높임)
     return JSON.stringify(response.data.organic.slice(0, 5));
   } catch (e) {
     return null;
   }
 }
 
-async function runNaverPlaceValidator() {
-  console.log("🚀 [Team] 네이버 플레이스 실시간 영업 검증 모드 가동");
+async function runNaverPlaceAgent() {
+  console.log("🚀 [Team] 네이버 플레이스 기반 실시간 영업 검증 시작...");
 
   const { data: existing } = await supabase.from("restaurants").select("name");
   const skipList = existing?.map((r) => r.name).join(", ") || "없음";
 
   for (let i = 1; i <= 5; i++) {
     try {
-      // 1. 후보 선정 (흑백요리사 실존 셰프)
+      // 1. 후보 선정 (JSON 키워드 포함)
       const collector = await groq.chat.completions.create({
         messages: [
           {
             role: "system",
             content:
-              '너는 흑백요리사 출연진 전문가야. 실제 출연이 확인된 유명 셰프 1명을 선정해. 형식: {"chef": "이름", "restaurant": "식당명"}',
+              "너는 흑백요리사 출연진 전문가야. 실제 출연 셰프 1명을 선정하여 반드시 JSON 형식으로 출력해.",
           },
           {
             role: "user",
-            content: `미등록 실존 출연자 1명 선정. 제외: [${skipList}]`,
+            content: `미등록 실존 출연자 1명 선정(제외: [${skipList}]). 형식: {"chef": "이름", "restaurant": "식당명"}`,
           },
         ],
         model: "llama-3.3-70b-versatile",
@@ -56,26 +56,28 @@ async function runNaverPlaceValidator() {
       const { chef, restaurant: hint } = JSON.parse(
         collector.choices[0].message.content,
       );
+      console.log(`🎯 [Target] 검증 대상: ${chef} (${hint})`);
 
-      // 2. 검색 쿼리를 '네이버 플레이스'로 타겟팅
+      // 2. 네이버 플레이스 타겟 검색
       const searchResult = await getSearchData(
-        `${hint} 네이버 플레이스 영업시간 주소`,
+        `${hint} 네이버 플레이스 영업중`,
       );
       if (!searchResult) continue;
 
-      // 3. 네이버 플레이스 정보 기반 엄격 검증
+      // 3. 네이버 플레이스 기반 엄격 검증 (JSON 키워드 포함)
       const validator = await groq.chat.completions.create({
         messages: [
           {
             role: "system",
-            content: `너는 네이버 플레이스 데이터 검증관이야. 
-          - 검색 결과에서 'map.naver.com' 링크나 실제 도로명 주소가 명확히 확인되는지 봐.
-          - 특히 '영업 중', '영업 종료', '라스트오더' 등 실시간 영업 정보가 감지되면 실존 식당으로 간주하고 95점을 줘.
-          - 블로그 후기만 있고 플레이스 정보가 없으면 0점을 줘.`,
+            content: `너는 네이버 플레이스 검증관이야. 
+          - 검색 결과에서 'map.naver.com' 링크와 실제 영업 상태(영업 중, 라스트오더 등)를 확인해.
+          - 실존하고 영업 중임이 확실하면 95점 이상을 줘.
+          - 모든 출력은 반드시 JSON 형식을 따라야 해.`,
           },
           {
             role: "user",
-            content: `검색 데이터: ${searchResult}. 식당명: ${hint}. 네이버 플레이스 기준으로 영업 중인지 확인해서 JSON 생성해.`,
+            content: `검색 데이터: ${searchResult}. 식당명: ${hint}. 위 정보를 바탕으로 다음 JSON을 생성해:
+          { "data": { "restaurant": { "name": "...", "address": "...", "lng": 0.0, "lat": 0.0, "category": "...", "menu_info": {}, "opening_hours": {} }, "source": { "name": "흑백요리사 시즌1 또는 2", "video_url": "..." } }, "confidence_score": 점수, "reason": "이유" }`,
           },
         ],
         model: "llama-3.3-70b-versatile",
@@ -83,6 +85,8 @@ async function runNaverPlaceValidator() {
       });
 
       const result = JSON.parse(validator.choices[0].message.content);
+
+      // [Decision] 네이버 플레이스 신뢰도 90점 이상만 통과
       if (result.confidence_score >= 90) {
         const { restaurant, source } = result.data;
 
@@ -123,12 +127,12 @@ async function runNaverPlaceValidator() {
           );
 
           console.log(
-            `✅ [Pass] 네이버 플레이스 검증 완료: ${restaurant.name}`,
+            `✅ [Pass] 네이버 플레이스 실시간 영업 확인: ${restaurant.name}`,
           );
         }
       } else {
         console.warn(
-          `⚠️ [Rejected] ${hint}: 네이버 플레이스 정보 불충분 (점수: ${result.confidence_score})`,
+          `⚠️ [Rejected] ${hint} (점수: ${result.confidence_score}): ${result.reason}`,
         );
       }
     } catch (err) {
@@ -137,4 +141,4 @@ async function runNaverPlaceValidator() {
   }
 }
 
-runNaverPlaceValidator();
+runNaverPlaceAgent();
