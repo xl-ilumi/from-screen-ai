@@ -21,112 +21,120 @@ async function getSearchData(query) {
         },
       },
     );
-    return JSON.stringify(response.data.organic.slice(0, 3));
+    return JSON.stringify(response.data.organic.slice(0, 5));
   } catch (e) {
-    return "검색 결과 없음";
+    return null;
   }
 }
 
-async function runAIAgentLoop() {
-  console.log("🚀 [System] 흑백요리사 전수 조사 및 실시간 검증 루프 시작...");
+async function runDualAgentWithConsoleLog() {
+  console.log("🚀 [Team] AI 상호 검증 팀 가동 (저장 vs 로그 분리)");
 
   const { data: existing } = await supabase.from("restaurants").select("name");
   const skipList = existing?.map((r) => r.name).join(", ") || "없음";
 
   for (let i = 1; i <= 5; i++) {
-    console.log(`\n🔄 [Batch ${i}/5] 리서치 단계...`);
-
     try {
-      // 1단계: 명확한 JSON 타겟 선정 (설명 금지 강제)
-      const planner = await groq.chat.completions.create({
+      // [Agent 1: Collector] 후보 발굴
+      const collector = await groq.chat.completions.create({
         messages: [
           {
             role: "system",
             content:
-              '너는 흑백요리사 출연진 데이터 전문가야. 반드시 JSON으로만 답해. 형식: {"target": "셰프이름 식당이름"}',
+              '흑백요리사 출연진 리서처. JSON 형식: {"chef": "이름", "restaurant": "식당명"}',
           },
           {
             role: "user",
-            content: `흑백요리사 시즌 1, 2 출연자 중 실존 식당을 운영하는 1명을 뽑아줘. 제외: [${skipList}]`,
-          },
-        ],
-        model: "llama-3.3-70b-versatile",
-        response_format: { type: "json_object" }, // JSON 모드 강제
-      });
-
-      const targetJson = JSON.parse(planner.choices[0].message.content);
-      const targetQuery = targetJson.target;
-      console.log(`🎯 [Target] 선정된 대상: ${targetQuery}`);
-
-      // 2단계: 실시간 검색
-      const searchResult = await getSearchData(
-        `${targetQuery} 주소 메뉴 영업시간`,
-      );
-
-      // 3단계: 최종 데이터 정제 및 검증
-      const finalCompletion = await groq.chat.completions.create({
-        messages: [
-          {
-            role: "system",
-            content: `너는 제공된 검색 데이터를 DB 스키마에 맞게 정제하는 전문가야. 
-            반드시 다음 JSON 형식을 엄격히 지켜. 설명이나 인사말은 절대 금지야.
-            {
-              "restaurant": { "name": "...", "category": "...", "address": "...", "lng": 0.0, "lat": 0.0, "image_url": "...", "menu_info": {}, "opening_hours": {} },
-              "source": { "name": "흑백요리사 시즌1 또는 시즌2", "type": "TV", "video_url": "...", "video_title": "...", "thumbnail_url": "...", "vod_url": "..." }
-            }`,
-          },
-          {
-            role: "user",
-            content: `검색 데이터: ${searchResult}. 이 정보를 바탕으로 실존 여부를 검증하여 JSON을 생성해.`,
+            content: `미등록 실존 출연자 1명 선정. 제외: [${skipList}]`,
           },
         ],
         model: "llama-3.3-70b-versatile",
         response_format: { type: "json_object" },
       });
 
-      const finalData = JSON.parse(finalCompletion.choices[0].message.content);
-      const { restaurant, source } = finalData;
+      const { chef, restaurant: hint } = JSON.parse(
+        collector.choices[0].message.content,
+      );
+      const searchResult = await getSearchData(
+        `${chef} ${hint} 흑백요리사 출연 식당`,
+      );
+      if (!searchResult) continue;
 
-      // 4단계: DB 저장
-      const { data: srcData } = await supabase
-        .from("sources")
-        .upsert({ name: source.name, type: "TV" }, { onConflict: "name" })
-        .select()
-        .single();
-      const { data: resData } = await supabase
-        .from("restaurants")
-        .upsert(
+      // [Agent 2: Validator] 비판적 검토
+      const validator = await groq.chat.completions.create({
+        messages: [
           {
-            name: restaurant.name,
-            category: restaurant.category,
-            address: restaurant.address,
-            location: `POINT(${restaurant.lng} ${restaurant.lat})`,
-            menu_info: restaurant.menu_info,
-            opening_hours: restaurant.opening_hours,
-            image_url: restaurant.image_url,
+            role: "system",
+            content:
+              '엄격한 데이터 검증관. 85점 미만은 반드시 사유 작성. JSON: {"data": {...}, "confidence_score": 점수, "reason": "이유"}',
           },
-          { onConflict: "name" },
-        )
-        .select()
-        .single();
+          {
+            role: "user",
+            content: `검색 데이터: ${searchResult}. 이 정보의 실존 여부를 점수로 매겨.`,
+          },
+        ],
+        model: "llama-3.3-70b-versatile",
+        response_format: { type: "json_object" },
+      });
 
-      if (resData && srcData) {
-        await supabase.from("appearances").upsert(
-          {
-            restaurant_id: resData.id,
-            source_id: srcData.id,
-            video_url:
-              source.video_url || `https://generated-url-${Date.now()}`,
-            title: source.video_title || `${restaurant.name} 출연 영상`,
-          },
-          { onConflict: "video_url" },
-        );
-        console.log(`✅ [Success] ${restaurant.name} 저장 완료!`);
+      const {
+        data: finalData,
+        confidence_score,
+        reason,
+      } = JSON.parse(validator.choices[0].message.content);
+
+      if (confidence_score >= 85) {
+        // ✅ [Pass] DB 저장
+        const { restaurant, source } = finalData;
+        const { data: resData } = await supabase
+          .from("restaurants")
+          .upsert(
+            {
+              name: restaurant.name,
+              category: restaurant.category,
+              address: restaurant.address,
+              location: `POINT(${restaurant.lng} ${restaurant.lat})`,
+              image_url: restaurant.image_url,
+              menu_info: restaurant.menu_info,
+              opening_hours: restaurant.opening_hours,
+              is_approved: true,
+            },
+            { onConflict: "name" },
+          )
+          .select()
+          .single();
+
+        if (resData) {
+          const { data: srcData } = await supabase
+            .from("sources")
+            .upsert({ name: source.name, type: "TV" }, { onConflict: "name" })
+            .select()
+            .single();
+          await supabase.from("appearances").upsert(
+            {
+              restaurant_id: resData.id,
+              source_id: srcData.id,
+              video_url: source.video_url,
+              title: source.video_title,
+            },
+            { onConflict: "video_url" },
+          );
+          console.log(
+            `✅ [Pass] ${restaurant.name} (${confidence_score}점) 저장 완료`,
+          );
+        }
+      } else {
+        // ⚠️ [Rejected] 콘솔에 상세 로그 출력
+        console.log("--------------------------------------------------");
+        console.warn(`⚠️ [Rejected] 대상: ${chef}`);
+        console.warn(`📊 신뢰도 점수: ${confidence_score}점`);
+        console.warn(`🧐 탈락 사유: ${reason}`);
+        console.log("--------------------------------------------------");
       }
     } catch (err) {
-      console.error(`❌ [Error] ${i}번째 실패:`, err.message);
+      console.error(`❌ [Error] 시스템 에러:`, err.message);
     }
   }
 }
 
-runAIAgentLoop();
+runDualAgentWithConsoleLog();
