@@ -21,27 +21,28 @@ async function getSearchData(query) {
         },
       },
     );
+    // 네이버 플레이스 링크나 주소 정보가 포함된 상위 검색결과 전달
     return JSON.stringify(response.data.organic.slice(0, 5));
   } catch (e) {
     return null;
   }
 }
 
-async function runDualAgentWithConsoleLog() {
-  console.log("🚀 [Team] AI 상호 검증 팀 가동 (저장 vs 로그 분리)");
+async function runNaverPlaceValidator() {
+  console.log("🚀 [Team] 네이버 플레이스 실시간 영업 검증 모드 가동");
 
   const { data: existing } = await supabase.from("restaurants").select("name");
   const skipList = existing?.map((r) => r.name).join(", ") || "없음";
 
   for (let i = 1; i <= 5; i++) {
     try {
-      // [Agent 1: Collector] 후보 발굴
+      // 1. 후보 선정 (흑백요리사 실존 셰프)
       const collector = await groq.chat.completions.create({
         messages: [
           {
             role: "system",
             content:
-              '흑백요리사 출연진 리서처. JSON 형식: {"chef": "이름", "restaurant": "식당명"}',
+              '너는 흑백요리사 출연진 전문가야. 실제 출연이 확인된 유명 셰프 1명을 선정해. 형식: {"chef": "이름", "restaurant": "식당명"}',
           },
           {
             role: "user",
@@ -55,37 +56,36 @@ async function runDualAgentWithConsoleLog() {
       const { chef, restaurant: hint } = JSON.parse(
         collector.choices[0].message.content,
       );
+
+      // 2. 검색 쿼리를 '네이버 플레이스'로 타겟팅
       const searchResult = await getSearchData(
-        `${chef} ${hint} 흑백요리사 출연 식당`,
+        `${hint} 네이버 플레이스 영업시간 주소`,
       );
       if (!searchResult) continue;
 
-      // [Agent 2: Validator] 비판적 검토
+      // 3. 네이버 플레이스 정보 기반 엄격 검증
       const validator = await groq.chat.completions.create({
         messages: [
           {
             role: "system",
-            content:
-              '엄격한 데이터 검증관. 85점 미만은 반드시 사유 작성. JSON: {"data": {...}, "confidence_score": 점수, "reason": "이유"}',
+            content: `너는 네이버 플레이스 데이터 검증관이야. 
+          - 검색 결과에서 'map.naver.com' 링크나 실제 도로명 주소가 명확히 확인되는지 봐.
+          - 특히 '영업 중', '영업 종료', '라스트오더' 등 실시간 영업 정보가 감지되면 실존 식당으로 간주하고 95점을 줘.
+          - 블로그 후기만 있고 플레이스 정보가 없으면 0점을 줘.`,
           },
           {
             role: "user",
-            content: `검색 데이터: ${searchResult}. 이 정보의 실존 여부를 점수로 매겨.`,
+            content: `검색 데이터: ${searchResult}. 식당명: ${hint}. 네이버 플레이스 기준으로 영업 중인지 확인해서 JSON 생성해.`,
           },
         ],
         model: "llama-3.3-70b-versatile",
         response_format: { type: "json_object" },
       });
 
-      const {
-        data: finalData,
-        confidence_score,
-        reason,
-      } = JSON.parse(validator.choices[0].message.content);
+      const result = JSON.parse(validator.choices[0].message.content);
+      if (result.confidence_score >= 90) {
+        const { restaurant, source } = result.data;
 
-      if (confidence_score >= 85) {
-        // ✅ [Pass] DB 저장
-        const { restaurant, source } = finalData;
         const { data: resData } = await supabase
           .from("restaurants")
           .upsert(
@@ -114,27 +114,27 @@ async function runDualAgentWithConsoleLog() {
             {
               restaurant_id: resData.id,
               source_id: srcData.id,
-              video_url: source.video_url,
-              title: source.video_title,
+              video_url:
+                source.video_url ||
+                `https://map.naver.com/search/${restaurant.name}`,
+              title: source.video_title || `${restaurant.name} 출연 정보`,
             },
             { onConflict: "video_url" },
           );
+
           console.log(
-            `✅ [Pass] ${restaurant.name} (${confidence_score}점) 저장 완료`,
+            `✅ [Pass] 네이버 플레이스 검증 완료: ${restaurant.name}`,
           );
         }
       } else {
-        // ⚠️ [Rejected] 콘솔에 상세 로그 출력
-        console.log("--------------------------------------------------");
-        console.warn(`⚠️ [Rejected] 대상: ${chef}`);
-        console.warn(`📊 신뢰도 점수: ${confidence_score}점`);
-        console.warn(`🧐 탈락 사유: ${reason}`);
-        console.log("--------------------------------------------------");
+        console.warn(
+          `⚠️ [Rejected] ${hint}: 네이버 플레이스 정보 불충분 (점수: ${result.confidence_score})`,
+        );
       }
     } catch (err) {
-      console.error(`❌ [Error] 시스템 에러:`, err.message);
+      console.error(`❌ [Error]:`, err.message);
     }
   }
 }
 
-runDualAgentWithConsoleLog();
+runNaverPlaceValidator();
