@@ -132,25 +132,32 @@ async function getSearchData(query) {
     );
     return JSON.stringify(response.data.organic.slice(0, 5));
   } catch (e) {
+    console.warn(
+      `⚠️ [Serper Error] 검색 데이터를 가져오는 데 실패했습니다: ${e.message}`,
+    );
     return null;
   }
 }
+async function runCreativeAgent() {
+  console.log("🚀 [Team] 창의적인 큐레이션 문구 생성 및 정밀 검증 가동");
 
-async function runStableAgent() {
-  console.log("🚀 [Team] 흑백요리사 정밀 검증 시스템 가동");
+  // 1. 이미 처리된 셰프 목록 가져오기 (appearances의 title에서 셰프 이름 확인)
+  const { data: existingApps } = await supabase
+    .from("appearances")
+    .select("title");
+  const processedTitles = existingApps?.map((a) => a.title).join(" ") || "";
 
-  const { data: existingRes } = await supabase
-    .from("restaurants")
-    .select("name");
-  const existingNames = existingRes?.map((r) => r.name) || [];
-
-  const targets = CHEF_MASTER_LIST.slice(0, 5); // 테스트를 위해 상위 5명 진행
+  // 2. 검색 대상 필터링 (이미 title에 포함된 셰프는 제외)
+  const targets = CHEF_MASTER_LIST.filter((c) => {
+    const mainName = c.search_name.split(" ")[0]; // "최현석 셰프" -> "최현석"
+    return !processedTitles.includes(mainName);
+  }).slice(0, 5);
 
   for (const target of targets) {
     try {
       console.log(`\n🎯 [Target] 조사 중: ${target.search_name}`);
 
-      const query = `흑백요리사 ${target.search_name} 현재 운영 중인 식당 네이버 플레이스 주소`;
+      const query = `${target.search_name} 식당 특징 메뉴 네이버 플레이스`;
       const searchResult = await getSearchData(query);
       if (!searchResult) continue;
 
@@ -158,10 +165,26 @@ async function runStableAgent() {
         messages: [
           {
             role: "system",
-            content: `너는 식당 정보 정제 전문가야. 반드시 JSON으로 답해. 
-            검색 결과를 분석해서 '현재 영업 중'인 식당 1곳만 골라. 
-            만약 영업 정보가 없거나 불확실하면 confidence_score를 50 미만으로 줘.
-            응답 형식: {"restaurant": {"name": "...", "address": "...", "lat": 0.0, "lng": 0.0, "category": "..."}, "confidence_score": 95, "reason": "..."}`,
+            content: `너는 미식 큐레이터이자 데이터 전문가야. 반드시 JSON으로 답해.
+            [출력 JSON 스키마]
+            {
+              "restaurant": {
+                "name": "식당 이름",
+                "category": "업종 (예: 한식/이탈리안)",
+                "address": "정확한 전체 주소",
+                "lat": 37.xxx,
+                "lng": 127.xxx
+              },
+              "creative_title": "셰프와 식당의 특징을 담은 매력적인 문구",
+              "confidence_score": 0~100 사이의 숫자 (주소와 정보가 확실할수록 높게),
+              "reason": "데이터가 부족하거나 불확실한 경우 그 이유 기록"
+            }
+            [작업 지침]
+            1. 검색 결과를 바탕으로 식당의 정보를 정제해.
+            2. 'restaurant.address'는 반드시 도로명 주소를 포함한 상세 주소여야 해. "광주광역시", "서울"처럼 시/도 명칭만 있는 주소는 절대 안 돼. 상세 주소가 없다면 confidence_score를 10 미만으로 줘.
+            3. 'restaurant.name'은 반드시 실제 식당의 간판에 적힌 공식 명칭이어야 해. '흑백요리사'나 셰프 이름이 식당 이름에 포함되어서는 안 돼.
+            4. 'creative_title'은 반드시 셰프의 이름과 특징이 포함되어야 해.
+            5. 정보가 부족하여 식당을 특정할 수 없다면 confidence_score를 50 미만으로 주고 reason을 상세히 적어.`,
           },
           {
             role: "user",
@@ -173,34 +196,62 @@ async function runStableAgent() {
       });
 
       const result = JSON.parse(validator.choices[0].message.content);
+      const usage = validator.usage;
+      console.log(
+        `📊 [Tokens] Input: ${usage.prompt_tokens}, Output: ${usage.completion_tokens}, Total: ${usage.total_tokens}`,
+      );
 
-      // confidence_score가 객체 바로 아래에 있는지 확인 (구조 파손 방지)
-      if (result.confidence_score >= 85 && result.restaurant?.name) {
-        // 중복 체크 (이미 저장된 식당명인지)
-        if (existingNames.includes(result.restaurant.name)) {
+      const INVALID_NAMES = ["흑백요리사", "넷플릭스", "셰프", "식당"];
+      const isInvalidName = INVALID_NAMES.some((invalid) =>
+        result.restaurant?.name?.includes(invalid),
+      );
+
+      // 주소 검증: 공백 기준 3개 이상의 단어가 있어야 함 (시/도 + 시/군/구 + 도로명 등)
+      const addressParts = result.restaurant?.address?.split(" ") || [];
+      const isInvalidAddress = addressParts.length < 3;
+
+      if (
+        result.confidence_score >= 80 &&
+        result.restaurant?.name &&
+        !isInvalidName &&
+        !isInvalidAddress
+      ) {
+        const { restaurant, creative_title } = result;
+
+        // 1. 식당 정보 저장 (주소 기반 중복 체크)
+        // 먼저 주소가 같은 식당이 있는지 확인
+        const { data: matchByAddr } = await supabase
+          .from("restaurants")
+          .select("id, name")
+          .eq("address", restaurant.address)
+          .maybeSingle();
+
+        let restaurantId;
+        if (matchByAddr) {
           console.log(
-            `⏭️ [Skip] 이미 존재하는 식당: ${result.restaurant.name}`,
+            `🔗 [Match] 동일 주소 식당 발견: ${matchByAddr.name} (ID: ${matchByAddr.id})`,
           );
-          continue;
+          restaurantId = matchByAddr.id;
+        } else {
+          const { data: resData } = await supabase
+            .from("restaurants")
+            .upsert(
+              {
+                name: restaurant.name,
+                category: restaurant.category,
+                address: restaurant.address,
+                location: `POINT(${restaurant.lng || 127.0276} ${restaurant.lat || 37.4979})`,
+                is_approved: true,
+              },
+              { onConflict: "name" },
+            )
+            .select()
+            .single();
+          restaurantId = resData?.id;
         }
 
-        const { restaurant } = result;
-        const { data: resData } = await supabase
-          .from("restaurants")
-          .upsert(
-            {
-              name: restaurant.name,
-              category: restaurant.category,
-              address: restaurant.address,
-              location: `POINT(${restaurant.lng} ${restaurant.lat})`,
-              is_approved: true,
-            },
-            { onConflict: "name" },
-          )
-          .select()
-          .single();
-
-        if (resData) {
+        if (restaurantId) {
+          // 2. 소스 정보 저장
           const { data: srcData } = await supabase
             .from("sources")
             .upsert(
@@ -213,29 +264,36 @@ async function runStableAgent() {
             .select()
             .single();
 
+          // 3. 출연 정보 저장
           await supabase.from("appearances").upsert(
             {
-              restaurant_id: resData.id,
+              restaurant_id: restaurantId,
               source_id: srcData.id,
               video_url: `https://map.naver.com/search/${encodeURIComponent(restaurant.name)}`,
-              title: `${target.search_name} 출연 정보`,
+              title: creative_title || `${target.search_name}의 대표 식당`,
             },
             { onConflict: "video_url" },
           );
 
-          console.log(
-            `✅ [Success] ${restaurant.name} 저장 완료 (${result.confidence_score}점)`,
-          );
+          console.log(`✅ [Success] ${restaurant.name}`);
+          console.log(`📝 [Curated] "${creative_title}"`);
         }
       } else {
         console.warn(
-          `⚠️ [Rejected] ${target.search_name}: ${result.reason} (${result.confidence_score}점)`,
+          `⚠️ [Rejected] ${target.search_name}: ${result.reason || "신뢰도 부족"}`,
         );
+        console.log(`📊 [Debug Result]:`, JSON.stringify(result, null, 2));
       }
     } catch (err) {
-      console.error(`❌ [Error]:`, err.message);
+      if (err.message.includes("Access denied")) {
+        console.error(
+          `❌ [Groq Error] Access denied: VPN을 사용 중이거나 특정 네트워크에서 Groq API 접근이 차단되었습니다.`,
+        );
+      } else {
+        console.error(`❌ [Error at ${target.search_name}]:`, err.message);
+      }
     }
   }
 }
 
-runStableAgent();
+runCreativeAgent();
